@@ -6,7 +6,7 @@ import os
 
 # ── Paths ────────────────────────────────────────────────────
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR   = os.path.join(BASE_DIR, "/content/drownis-detection/data/driver_drowsiness_dataset")     # ← ضع مسار داتاك هنا
+DATA_DIR   = os.path.join(BASE_DIR, "/content/drownis-detection/data/driver_drowsiness_dataset/Driver")     # ← ضع مسار داتاك هنا
 MODELS_DIR = os.path.join(BASE_DIR, "saved_models")
 LOGS_DIR   = os.path.join(BASE_DIR, "logs")
 
