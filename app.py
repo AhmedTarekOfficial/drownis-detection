@@ -497,7 +497,8 @@ with tab_webcam:
             st.session_state.running = False
         else:
             try:
-                engine = load_engine(model_path)
+                 engine = load_engine(model_path)   # ✅ was: load_engine(eye_path, ...)
+                 cap = cv2.VideoCapture(tmp_path)
             except Exception as e:
                 st.error(f"Failed to load models: {e}")
                 st.session_state.running = False
