@@ -1,7 +1,7 @@
 torch>=2.0.0
 torchvision>=0.15.0
 
-opencv-python-headless>=4.8.0
+opencv-python-headless==4.10.0.84
 mediapipe>=0.10.30
 
 numpy>=1.26.0
