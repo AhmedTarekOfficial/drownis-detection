@@ -15,7 +15,12 @@ from config import *
 from models import build_model, get_device
 
 
-mp_face_mesh = mp.solutions.face_mesh
+# Support both old (<=0.10.9) and new MediaPipe API
+try:
+    mp_face_mesh = mp.solutions.face_mesh
+except AttributeError:
+    mp_face_mesh = None
+    print("Warning: mediapipe.solutions not available. Install mediapipe==0.10.9")
 
 
 # ──────────────────────────────────────────────────────────────
