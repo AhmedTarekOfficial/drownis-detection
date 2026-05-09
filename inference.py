@@ -1,376 +1,569 @@
+# Clean Refactored `inference.py`
+
+```python
 # ============================================================
-#  inference.py  —  PyTorch Fatigue Detection Engine
-#  Compatible with mediapipe >= 0.10.30 (new Tasks API)
+# inference.py — Clean Fatigue Detection Engine
+# Refactored Version
 # ============================================================
 
+import os
+import math
+import urllib.request
+from collections import deque
+
 import cv2
+import mediapipe as mp
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torchvision import transforms
-from collections import deque
-import math
-import urllib.request
-import os
+
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python.vision import (
+    FaceLandmarker,
+    FaceLandmarkerOptions,
+    RunningMode,
+)
 
 from config import *
 from models import build_model, get_device
 
 
-# ──────────────────────────────────────────────────────────────
-# MEDIAPIPE  —  new Tasks API (0.10.30+)
-# ──────────────────────────────────────────────────────────────
-import mediapipe as mp
-from mediapipe.tasks import python as mp_python
-from mediapipe.tasks.python import vision as mp_vision
-from mediapipe.tasks.python.vision import FaceLandmarker, FaceLandmarkerOptions, RunningMode
+# ============================================================
+# DOWNLOAD LANDMARK MODEL
+# ============================================================
 
-# Download the face landmarker model if not present
 LANDMARKER_PATH = "face_landmarker.task"
 
-def _download_landmarker():
-    if not os.path.exists(LANDMARKER_PATH):
-        print("Downloading MediaPipe face landmarker model...")
-        url = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
-        urllib.request.urlretrieve(url, LANDMARKER_PATH)
-        print("  ✓ Downloaded face_landmarker.task")
 
-_download_landmarker()
+def download_landmarker():
+    if os.path.exists(LANDMARKER_PATH):
+        return
 
+    print("Downloading MediaPipe face landmarker...")
 
-# ──────────────────────────────────────────────────────────────
-# GEOMETRY HELPERS
-# ──────────────────────────────────────────────────────────────
-def _euclidean(p1, p2):
-    return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
+    url = (
+        "https://storage.googleapis.com/mediapipe-models/"
+        "face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+    )
 
-def compute_ear(landmarks, eye_indices, w, h):
-    pts = [(int(landmarks[i].x * w), int(landmarks[i].y * h)) for i in eye_indices]
-    vert1 = _euclidean(pts[1], pts[5])
-    vert2 = _euclidean(pts[2], pts[4])
-    horiz = _euclidean(pts[0], pts[3])
-    return (vert1 + vert2) / (2.0 * horiz + 1e-6)
+    urllib.request.urlretrieve(url, LANDMARKER_PATH)
 
-def compute_mar(landmarks, mouth_indices, w, h):
-    pts = [(int(landmarks[i].x * w), int(landmarks[i].y * h)) for i in mouth_indices]
-    return _euclidean(pts[2], pts[6]) / (_euclidean(pts[0], pts[4]) + 1e-6)
-
-def compute_pitch(landmarks, w, h):
-    model_pts = np.array([
-        [0.0,0.0,0.0],[0.0,-63.6,-12.5],[-43.3,32.7,-26.0],
-        [43.3,32.7,-26.0],[-28.9,-28.9,-24.1],[28.9,-28.9,-24.1]
-    ], dtype=np.float64)
-    img_pts = np.array([
-        (landmarks[i].x * w, landmarks[i].y * h)
-        for i in [1, 152, 263, 33, 287, 57]
-    ], dtype=np.float64)
-    fl  = float(w)
-    cam = np.array([[fl,0,w/2],[0,fl,h/2],[0,0,1]], dtype=np.float64)
-    ok, rvec, _ = cv2.solvePnP(model_pts, img_pts, cam, np.zeros((4,1)),
-                                flags=cv2.SOLVEPNP_ITERATIVE)
-    if not ok: return 0.0
-    rmat, _ = cv2.Rodrigues(rvec)
-    angles, *_ = cv2.RQDecomp3x3(rmat)
-    return angles[0]
+    print("✓ Download complete")
 
 
-# ──────────────────────────────────────────────────────────────
-# ROI EXTRACTION
-# ──────────────────────────────────────────────────────────────
-def extract_face_roi(frame, landmarks, w, h, padding=30):
-    all_pts = np.array([(int(lm.x*w), int(lm.y*h)) for lm in landmarks])
-    x1 = max(0, all_pts[:,0].min() - padding)
-    x2 = min(w, all_pts[:,0].max() + padding)
-    y1 = max(0, all_pts[:,1].min() - padding)
-    y2 = min(h, all_pts[:,1].max() + padding)
-    roi = frame[y1:y2, x1:x2]
-    return roi if roi.size > 0 else None
+# ============================================================
+# IMAGE PREPROCESSING
+# ============================================================
 
-
-# ──────────────────────────────────────────────────────────────
-# PREPROCESS FOR PYTORCH
-# ──────────────────────────────────────────────────────────────
 preprocess = transforms.Compose([
     transforms.ToPILImage(),
     transforms.Resize(IMG_SIZE),
     transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406],
-                         [0.229, 0.224, 0.225]),
+    transforms.Normalize(
+        [0.485, 0.456, 0.406],
+        [0.229, 0.224, 0.225],
+    ),
 ])
 
+
+# ============================================================
+# GEOMETRY HELPERS
+# ============================================================
+
+
+def euclidean(p1, p2):
+    return math.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
+
+
+
+def landmarks_to_points(landmarks, indices, w, h):
+    return [
+        (
+            int(landmarks[i].x * w),
+            int(landmarks[i].y * h),
+        )
+        for i in indices
+    ]
+
+
+
+def compute_ear(landmarks, eye_indices, w, h):
+    pts = landmarks_to_points(landmarks, eye_indices, w, h)
+
+    vertical_1 = euclidean(pts[1], pts[5])
+    vertical_2 = euclidean(pts[2], pts[4])
+    horizontal = euclidean(pts[0], pts[3])
+
+    return (vertical_1 + vertical_2) / (2.0 * horizontal + 1e-6)
+
+
+
+def compute_mar(landmarks, mouth_indices, w, h):
+    pts = landmarks_to_points(landmarks, mouth_indices, w, h)
+
+    vertical = euclidean(pts[2], pts[6])
+    horizontal = euclidean(pts[0], pts[4])
+
+    return vertical / (horizontal + 1e-6)
+
+
+
+def compute_pitch(landmarks, w, h):
+
+    model_points = np.array([
+        [0.0, 0.0, 0.0],
+        [0.0, -63.6, -12.5],
+        [-43.3, 32.7, -26.0],
+        [43.3, 32.7, -26.0],
+        [-28.9, -28.9, -24.1],
+        [28.9, -28.9, -24.1],
+    ], dtype=np.float64)
+
+    image_points = np.array([
+        (landmarks[i].x * w, landmarks[i].y * h)
+        for i in [1, 152, 263, 33, 287, 57]
+    ], dtype=np.float64)
+
+    focal_length = float(w)
+
+    camera_matrix = np.array([
+        [focal_length, 0, w / 2],
+        [0, focal_length, h / 2],
+        [0, 0, 1],
+    ], dtype=np.float64)
+
+    success, rotation_vector, _ = cv2.solvePnP(
+        model_points,
+        image_points,
+        camera_matrix,
+        np.zeros((4, 1)),
+        flags=cv2.SOLVEPNP_ITERATIVE,
+    )
+
+    if not success:
+        return 0.0
+
+    rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
+    angles, *_ = cv2.RQDecomp3x3(rotation_matrix)
+
+    return angles[0]
+
+
+# ============================================================
+# DRAWING
+# ============================================================
+
+
+def draw_landmarks(frame, landmarks, w, h):
+
+    # Full mesh
+    for lm in landmarks:
+        x = int(lm.x * w)
+        y = int(lm.y * h)
+
+        cv2.circle(frame, (x, y), 1, (0, 180, 180), -1)
+
+    # Eyes
+    for idx in LEFT_EYE_IDX + RIGHT_EYE_IDX:
+        x = int(landmarks[idx].x * w)
+        y = int(landmarks[idx].y * h)
+
+        cv2.circle(frame, (x, y), 3, (0, 229, 255), -1)
+
+    left_eye = np.array(
+        landmarks_to_points(landmarks, LEFT_EYE_IDX, w, h),
+        dtype=np.int32,
+    )
+
+    right_eye = np.array(
+        landmarks_to_points(landmarks, RIGHT_EYE_IDX, w, h),
+        dtype=np.int32,
+    )
+
+    cv2.polylines(frame, [left_eye], True, (0, 229, 255), 1)
+    cv2.polylines(frame, [right_eye], True, (0, 229, 255), 1)
+
+    # Mouth
+    for idx in MOUTH_IDX:
+        x = int(landmarks[idx].x * w)
+        y = int(landmarks[idx].y * h)
+
+        cv2.circle(frame, (x, y), 3, (0, 215, 255), -1)
+
+    mouth = np.array(
+        landmarks_to_points(landmarks, MOUTH_IDX, w, h),
+        dtype=np.int32,
+    )
+
+    cv2.polylines(frame, [mouth], True, (0, 215, 255), 1)
+
+
+
+def draw_hud(frame, result):
+
+    h, w = frame.shape[:2]
+
+    score = result["fatigue_score"]
+    level = result["fatigue_level"]
+
+    colors = {
+        "ALERT": (0, 200, 0),
+        "WARNING": (0, 200, 255),
+        "DANGER": (0, 0, 255),
+    }
+
+    color = colors[level]
+
+    # Main score bar
+    cv2.rectangle(frame, (10, 10), (260, 30), (30, 30, 30), -1)
+
+    bar_width = int(score / 100 * 250)
+
+    cv2.rectangle(frame, (10, 10), (10 + bar_width, 30), color, -1)
+
+    cv2.rectangle(frame, (10, 10), (260, 30), (80, 80, 80), 1)
+
+    cv2.putText(
+        frame,
+        f"{level}  {score:.0f}%",
+        (10, 55),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        color,
+        2,
+    )
+
+    cv2.putText(
+        frame,
+        (
+            f"EAR:{result['ear']:.2f}  "
+            f"MAR:{result['mar']:.2f}  "
+            f"Pitch:{result['pitch']:.1f}"
+        ),
+        (10, 80),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (200, 200, 200),
+        1,
+    )
+
+    # Drowsiness probability
+    prob = result["drowsy_prob"]
+
+    cv2.putText(
+        frame,
+        "DROWSY PROB",
+        (10, h - 35),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.35,
+        (120, 120, 120),
+        1,
+    )
+
+    cv2.rectangle(frame, (10, h - 25), (130, h - 12), (30, 30, 30), -1)
+
+    cv2.rectangle(
+        frame,
+        (10, h - 25),
+        (10 + int(prob * 120), h - 12),
+        color,
+        -1,
+    )
+
+
+# ============================================================
+# ROI EXTRACTION
+# ============================================================
+
+
+def extract_face_roi(frame, landmarks, w, h, padding=30):
+
+    points = np.array([
+        (int(lm.x * w), int(lm.y * h))
+        for lm in landmarks
+    ])
+
+    x1 = max(0, points[:, 0].min() - padding)
+    x2 = min(w, points[:, 0].max() + padding)
+
+    y1 = max(0, points[:, 1].min() - padding)
+    y2 = min(h, points[:, 1].max() + padding)
+
+    roi = frame[y1:y2, x1:x2]
+
+    if roi.size == 0:
+        return None
+
+    return roi
+
+
+
 def preprocess_roi(roi):
+
     rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-    return preprocess(rgb).unsqueeze(0)
+
+    tensor = preprocess(rgb)
+
+    return tensor.unsqueeze(0)
 
 
-# ──────────────────────────────────────────────────────────────
+# ============================================================
 # FATIGUE ENGINE
-# ──────────────────────────────────────────────────────────────
+# ============================================================
+
+
 class FatigueEngine:
-    def __init__(self, model_path: str):
+
+    def __init__(self, model_path):
+
+        download_landmarker()
+
         self.device = get_device()
 
-        # Load PyTorch model
-        self.model = build_model(freeze_backbone=False)
-        self.model.load_state_dict(
-            torch.load(model_path, map_location=self.device, weights_only=True)
-        )
-        self.model.to(self.device)
-        self.model.eval()
-        print(f"  ✓ Model loaded: {model_path}")
+        self.model = self.load_model(model_path)
 
-        # MediaPipe Face Landmarker (new Tasks API)
+        self.landmarker = self.create_landmarker()
+
+        self.score_history = deque(maxlen=TEMPORAL_WINDOW)
+        self.ear_history = deque(maxlen=TEMPORAL_WINDOW)
+
+    # ========================================================
+    # MODEL
+    # ========================================================
+
+    def load_model(self, model_path):
+
+        model = build_model(freeze_backbone=False)
+
+        model.load_state_dict(
+            torch.load(
+                model_path,
+                map_location=self.device,
+                weights_only=True,
+            )
+        )
+
+        model.to(self.device)
+        model.eval()
+
+        print(f"✓ Model loaded: {model_path}")
+
+        return model
+
+    # ========================================================
+    # MEDIAPIPE
+    # ========================================================
+
+    def create_landmarker(self):
+
         options = FaceLandmarkerOptions(
-            base_options=mp_python.BaseOptions(model_asset_path=LANDMARKER_PATH),
+            base_options=mp_python.BaseOptions(
+                model_asset_path=LANDMARKER_PATH
+            ),
             running_mode=RunningMode.IMAGE,
             num_faces=1,
             min_face_detection_confidence=FACE_CONFIDENCE,
             min_face_presence_confidence=FACE_CONFIDENCE,
             min_tracking_confidence=LANDMARK_CONFIDENCE,
         )
-        self.landmarker = FaceLandmarker.create_from_options(options)
 
-        # Buffers
-        self.score_history = deque(maxlen=TEMPORAL_WINDOW)
-        self.ear_history   = deque(maxlen=TEMPORAL_WINDOW)
-        self.frame_count   = 0
+        return FaceLandmarker.create_from_options(options)
 
-    def _get_landmarks(self, frame):
-        """Run face landmarker → returns landmark list or None"""
-        rgb       = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image  = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        result    = self.landmarker.detect(mp_image)
+    # ========================================================
+    # LANDMARK DETECTION
+    # ========================================================
+
+    def get_landmarks(self, frame):
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        mp_image = mp.Image(
+            image_format=mp.ImageFormat.SRGB,
+            data=rgb,
+        )
+
+        result = self.landmarker.detect(mp_image)
+
         if not result.face_landmarks:
             return None
-        return result.face_landmarks[0]   # list of NormalizedLandmark
 
-    def _predict(self, roi):
-        tensor = preprocess_roi(roi).to(self.device)
+        return result.face_landmarks[0]
+
+    # ========================================================
+    # CNN PREDICTION
+    # ========================================================
+
+    def predict_batch(self, rois):
+
+        tensors = [preprocess_roi(roi) for roi in rois]
+
+        batch = torch.cat(tensors, dim=0).to(self.device)
+
         with torch.no_grad():
-            logits = self.model(tensor)
-            prob   = F.softmax(logits, dim=1)[0][1].item()
-        return prob
+            logits = self.model(batch)
+            probs = F.softmax(logits, dim=1)[:, 1]
 
-    def process_batch(self, frames: list) -> list:
-        """
-        Batch processing — بيحلل كذا frame دفعة واحدة
-        الـ CNN بيشتغل مرة واحدة على كل الـ frames مش frame-by-frame
-        ده بيستغل الـ GPU parallelism وبيوفر ~60-70% من الوقت
-        """
+        return probs.cpu().tolist()
+
+    # ========================================================
+    # SCORE CALCULATION
+    # ========================================================
+
+    def compute_score(self, prob, ear, mar, pitch):
+
+        perclos = (
+            (np.array(self.ear_history) < EAR_THRESHOLD).mean()
+            if self.ear_history
+            else 0.0
+        )
+
+        score = (
+            prob * 60
+            + perclos * 25
+            + float(mar > MAR_THRESHOLD) * 10
+            + float(abs(pitch) > PITCH_THRESHOLD) * 5
+        )
+
+        self.score_history.append(score)
+
+        return float(np.mean(self.score_history))
+
+    # ========================================================
+    # LEVEL CLASSIFICATION
+    # ========================================================
+
+    @staticmethod
+    def classify_level(score):
+
+        if score >= 60:
+            return "DANGER"
+
+        if score >= 30:
+            return "WARNING"
+
+        return "ALERT"
+
+    # ========================================================
+    # PROCESS SINGLE FRAME
+    # ========================================================
+
+    def process_frame(self, frame):
+
+        results = self.process_batch([frame])
+
+        return results[0]
+
+    # ========================================================
+    # PROCESS BATCH
+    # ========================================================
+
+    def process_batch(self, frames):
+
         if not frames:
             return []
 
-        h, w    = frames[0].shape[:2]
-        results  = []
-        rois     = []
-        canvases = []
-        lms      = []
+        h, w = frames[0].shape[:2]
 
-        # ── Step 1: Landmarks على كل frame (sequential - MediaPipe مش batch) ──
+        rois = []
+        temp_results = []
+
+        # ----------------------------------------------------
+        # STEP 1 — LANDMARKS + FEATURES
+        # ----------------------------------------------------
+
         for frame in frames:
-            canvas = frame.copy()
-            lm     = self._get_landmarks(frame)
+
+            annotated = frame.copy()
 
             result = {
-                "frame": canvas, "face_detected": False,
-                "ear": 0.0, "mar": 0.0, "pitch": 0.0,
-                "drowsy_prob": 0.0, "fatigue_score": 0.0, "fatigue_level": "ALERT"
+                "frame": annotated,
+                "face_detected": False,
+                "ear": 0.0,
+                "mar": 0.0,
+                "pitch": 0.0,
+                "drowsy_prob": 0.0,
+                "fatigue_score": 0.0,
+                "fatigue_level": "ALERT",
             }
 
-            if lm is not None:
-                result["face_detected"] = True
-                draw_landmarks(canvas, lm, w, h)
+            landmarks = self.get_landmarks(frame)
 
-                ear   = (compute_ear(lm, LEFT_EYE_IDX, w, h) +
-                         compute_ear(lm, RIGHT_EYE_IDX, w, h)) / 2
-                mar   = compute_mar(lm, MOUTH_IDX, w, h)
-                pitch = compute_pitch(lm, w, h)
-                result.update({"ear": ear, "mar": mar, "pitch": pitch})
-                self.ear_history.append(ear)
+            if landmarks is None:
+                draw_hud(annotated, result)
+                temp_results.append(result)
 
-                roi = extract_face_roi(frame, lm, w, h)
-                rois.append(roi if roi is not None
-                            else np.zeros((*IMG_SIZE, 3), np.uint8))
-            else:
                 rois.append(np.zeros((*IMG_SIZE, 3), np.uint8))
+                continue
 
-            lms.append(lm)
-            canvases.append(canvas)
-            results.append(result)
+            result["face_detected"] = True
 
-        # ── Step 2: CNN على كل الـ ROIs دفعة واحدة ← هنا السرعة ──
-        tensors = [preprocess_roi(roi) for roi in rois]
-        batch   = torch.cat(tensors, dim=0).to(self.device)
-        with torch.no_grad():
-            probs = F.softmax(self.model(batch), dim=1)[:, 1].cpu().tolist()
+            draw_landmarks(annotated, landmarks, w, h)
 
-        # ── Step 3: Score + HUD لكل frame ──
-        for result, prob, lm, canvas in zip(results, probs, lms, canvases):
+            ear = (
+                compute_ear(landmarks, LEFT_EYE_IDX, w, h)
+                + compute_ear(landmarks, RIGHT_EYE_IDX, w, h)
+            ) / 2.0
+
+            mar = compute_mar(landmarks, MOUTH_IDX, w, h)
+
+            pitch = compute_pitch(landmarks, w, h)
+
+            self.ear_history.append(ear)
+
+            result["ear"] = ear
+            result["mar"] = mar
+            result["pitch"] = pitch
+
+            roi = extract_face_roi(frame, landmarks, w, h)
+
+            if roi is None:
+                roi = np.zeros((*IMG_SIZE, 3), np.uint8)
+
+            rois.append(roi)
+            temp_results.append(result)
+
+        # ----------------------------------------------------
+        # STEP 2 — CNN BATCH PREDICTION
+        # ----------------------------------------------------
+
+        probs = self.predict_batch(rois)
+
+        # ----------------------------------------------------
+        # STEP 3 — FINAL RESULTS
+        # ----------------------------------------------------
+
+        final_results = []
+
+        for result, prob in zip(temp_results, probs):
+
             if not result["face_detected"]:
-                draw_hud(canvas, result)
+                final_results.append(result)
                 continue
 
             result["drowsy_prob"] = prob
-            perclos = (np.array(self.ear_history) < EAR_THRESHOLD).mean()                       if self.ear_history else 0.0
-            score = (prob * 60 + perclos * 25 +
-                     float(result["mar"] > MAR_THRESHOLD) * 10 +
-                     float(abs(result["pitch"]) > PITCH_THRESHOLD) * 5)
 
-            self.score_history.append(score)
-            smooth = np.mean(self.score_history)
-            result["fatigue_score"] = smooth
-            result["fatigue_level"] = (
-                "DANGER"  if smooth >= 60 else
-                "WARNING" if smooth >= 30 else "ALERT"
+            score = self.compute_score(
+                prob,
+                result["ear"],
+                result["mar"],
+                result["pitch"],
             )
-            draw_hud(canvas, result)
 
-        return results
+            result["fatigue_score"] = score
+            result["fatigue_level"] = self.classify_level(score)
 
-    def process_frame(self, frame: np.ndarray) -> dict:
-        self.frame_count += 1
-        h, w = frame.shape[:2]
+            draw_hud(result["frame"], result)
 
-        result = {
-            "frame":         frame.copy(),
-            "face_detected": False,
-            "ear":           0.0,
-            "mar":           0.0,
-            "pitch":         0.0,
-            "drowsy_prob":   0.0,
-            "fatigue_score": 0.0,
-            "fatigue_level": "ALERT",
-        }
+            final_results.append(result)
 
-        landmarks = self._get_landmarks(frame)
-        if landmarks is None:
-            return result
+        return final_results
 
-        result["face_detected"] = True
-
-        # ── Draw landmarks immediately on frame ───────────────
-        ann = frame.copy()
-        for lm in landmarks:
-            cv2.circle(ann, (int(lm.x * w), int(lm.y * h)), 1, (0, 180, 180), -1)
-        for idx in LEFT_EYE_IDX + RIGHT_EYE_IDX:
-            cv2.circle(ann, (int(landmarks[idx].x * w), int(landmarks[idx].y * h)), 3, (0, 229, 255), -1)
-        eye_pts_l = np.array([(int(landmarks[i].x*w), int(landmarks[i].y*h)) for i in LEFT_EYE_IDX],  dtype=np.int32)
-        eye_pts_r = np.array([(int(landmarks[i].x*w), int(landmarks[i].y*h)) for i in RIGHT_EYE_IDX], dtype=np.int32)
-        cv2.polylines(ann, [eye_pts_l], True, (0, 229, 255), 1)
-        cv2.polylines(ann, [eye_pts_r], True, (0, 229, 255), 1)
-        for idx in MOUTH_IDX:
-            cv2.circle(ann, (int(landmarks[idx].x * w), int(landmarks[idx].y * h)), 3, (0, 215, 255), -1)
-        mouth_pts = np.array([(int(landmarks[i].x*w), int(landmarks[i].y*h)) for i in MOUTH_IDX], dtype=np.int32)
-        cv2.polylines(ann, [mouth_pts], True, (0, 215, 255), 1)
-        frame = ann   # use annotated frame from here on
-        # ─────────────────────────────────────────────────────
-
-        ear   = (compute_ear(landmarks, LEFT_EYE_IDX,  w, h) +
-                 compute_ear(landmarks, RIGHT_EYE_IDX, w, h)) / 2.0
-        mar   = compute_mar(landmarks, MOUTH_IDX, w, h)
-        pitch = compute_pitch(landmarks, w, h)
-
-        result.update({"ear": ear, "mar": mar, "pitch": pitch})
-        self.ear_history.append(ear)
-
-        # CNN prediction
-        face_roi    = extract_face_roi(frame, landmarks, w, h)
-        drowsy_prob = self._predict(face_roi) if face_roi is not None \
-                      else float(ear < EAR_THRESHOLD or mar > MAR_THRESHOLD)
-        result["drowsy_prob"] = drowsy_prob
-
-        # PERCLOS
-        perclos = (np.array(self.ear_history) < EAR_THRESHOLD).mean() \
-                  if self.ear_history else 0.0
-
-        # Score fusion
-        score = (
-            drowsy_prob                          * 60 +
-            perclos                              * 25 +
-            float(mar > MAR_THRESHOLD)           * 10 +
-            float(abs(pitch) > PITCH_THRESHOLD)  *  5
-        )
-        self.score_history.append(score)
-        smooth = np.mean(self.score_history)
-        result["fatigue_score"] = smooth
-        result["fatigue_level"] = (
-            "DANGER"  if smooth >= 60 else
-            "WARNING" if smooth >= 30 else
-            "ALERT"
-        )
-
-        result["landmarks"] = landmarks
-        result["frame"] = self._annotate(frame, result)
-        return result
-
-    def _annotate(self, frame, result):
-        ann   = frame.copy()
-        h, w  = ann.shape[:2]
-        score = result["fatigue_score"]
-        level = result["fatigue_level"]
-        color = {"ALERT":(0,200,0),"WARNING":(0,200,255),"DANGER":(0,0,255)}[level]
-        landmarks = result.get("landmarks", None)
-
-        # ── Draw all 468 face landmarks ───────────────────────
-        if landmarks is not None and len(landmarks) > 0:
-            # Full mesh — tiny dots for all points
-            for lm in landmarks:
-                x = int(lm.x * w)
-                y = int(lm.y * h)
-                cv2.circle(ann, (x, y), 1, (0, 180, 180), -1)
-
-            # Eye landmarks — highlighted in accent color
-            for idx in LEFT_EYE_IDX + RIGHT_EYE_IDX:
-                x = int(landmarks[idx].x * w)
-                y = int(landmarks[idx].y * h)
-                cv2.circle(ann, (x, y), 3, (0, 229, 255), -1)
-
-            # Connect eye points with lines
-            for eye_idx in [LEFT_EYE_IDX, RIGHT_EYE_IDX]:
-                pts = np.array([
-                    (int(landmarks[i].x * w), int(landmarks[i].y * h))
-                    for i in eye_idx
-                ], dtype=np.int32)
-                cv2.polylines(ann, [pts], isClosed=True, color=(0, 229, 255), thickness=1)
-
-            # Mouth landmarks — highlighted in yellow
-            for idx in MOUTH_IDX:
-                x = int(landmarks[idx].x * w)
-                y = int(landmarks[idx].y * h)
-                cv2.circle(ann, (x, y), 3, (0, 215, 255), -1)
-
-            # Connect mouth points
-            mouth_pts = np.array([
-                (int(landmarks[i].x * w), int(landmarks[i].y * h))
-                for i in MOUTH_IDX
-            ], dtype=np.int32)
-            cv2.polylines(ann, [mouth_pts], isClosed=True, color=(0, 215, 255), thickness=1)
-
-        # ── HUD overlay ───────────────────────────────────────
-        # Score bar background
-        cv2.rectangle(ann, (10, 10), (260, 30), (30, 30, 30), -1)
-        bar_w = int(score / 100 * 250)
-        cv2.rectangle(ann, (10, 10), (10 + bar_w, 30), color, -1)
-        cv2.rectangle(ann, (10, 10), (260, 30), (80, 80, 80), 1)
-
-        # Level + score text
-        cv2.putText(ann, f"{level}  {score:.0f}%",
-                    (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-
-        # Metrics
-        cv2.putText(ann,
-                    f"EAR:{result['ear']:.2f}  MAR:{result['mar']:.2f}  Pitch:{result['pitch']:.1f}deg",
-                    (10, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1)
-
-        # Drowsy probability bar (small, bottom left)
-        prob = result.get("drowsy_prob", 0)
-        prob_w = int(prob * 120)
-        cv2.putText(ann, "DROWSY PROB", (10, h - 35),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (120, 120, 120), 1)
-        cv2.rectangle(ann, (10, h - 25), (130, h - 12), (30, 30, 30), -1)
-        cv2.rectangle(ann, (10, h - 25), (10 + prob_w, h - 12), color, -1)
-
-        return ann
+    # ========================================================
+    # CLEANUP
+    # ========================================================
 
     def release(self):
         self.landmarker.close()
+
+
