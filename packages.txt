@@ -1,9 +1,6 @@
 libgl1
-libglib2.0-0
+libgles2
+libegl1
 libsm6
 libxrender1
 libxext6
-libgomp1
-ffmpeg
-libgles2
-libegl1
