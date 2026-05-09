@@ -1,10 +1,6 @@
-# Clean Refactored `inference.py`
-
-```python
+# -*- coding: utf-8 -*-
 # ============================================================
-# inference.py — Clean Fatigue Detection Engine
-# Refactored Version
-# ============================================================
+# inference.py — PyTorch Fatigue Detection Engine
 
 import os
 import math
