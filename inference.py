@@ -169,7 +169,7 @@ class FatigueEngine:
         # ── Step 1: Landmarks على كل frame (sequential - MediaPipe مش batch) ──
         for frame in frames:
             canvas = frame.copy()
-            lm     = self._get_lm(frame)
+            lm     = self._get_landmarks(frame)
 
             result = {
                 "frame": canvas, "face_detected": False,
