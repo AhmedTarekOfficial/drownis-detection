@@ -172,6 +172,23 @@ class FatigueEngine:
 
         result["face_detected"] = True
 
+        # ── Draw landmarks immediately on frame ───────────────
+        ann = frame.copy()
+        for lm in landmarks:
+            cv2.circle(ann, (int(lm.x * w), int(lm.y * h)), 1, (0, 180, 180), -1)
+        for idx in LEFT_EYE_IDX + RIGHT_EYE_IDX:
+            cv2.circle(ann, (int(landmarks[idx].x * w), int(landmarks[idx].y * h)), 3, (0, 229, 255), -1)
+        eye_pts_l = np.array([(int(landmarks[i].x*w), int(landmarks[i].y*h)) for i in LEFT_EYE_IDX],  dtype=np.int32)
+        eye_pts_r = np.array([(int(landmarks[i].x*w), int(landmarks[i].y*h)) for i in RIGHT_EYE_IDX], dtype=np.int32)
+        cv2.polylines(ann, [eye_pts_l], True, (0, 229, 255), 1)
+        cv2.polylines(ann, [eye_pts_r], True, (0, 229, 255), 1)
+        for idx in MOUTH_IDX:
+            cv2.circle(ann, (int(landmarks[idx].x * w), int(landmarks[idx].y * h)), 3, (0, 215, 255), -1)
+        mouth_pts = np.array([(int(landmarks[i].x*w), int(landmarks[i].y*h)) for i in MOUTH_IDX], dtype=np.int32)
+        cv2.polylines(ann, [mouth_pts], True, (0, 215, 255), 1)
+        frame = ann   # use annotated frame from here on
+        # ─────────────────────────────────────────────────────
+
         ear   = (compute_ear(landmarks, LEFT_EYE_IDX,  w, h) +
                  compute_ear(landmarks, RIGHT_EYE_IDX, w, h)) / 2.0
         mar   = compute_mar(landmarks, MOUTH_IDX, w, h)
@@ -219,7 +236,7 @@ class FatigueEngine:
         landmarks = result.get("landmarks", None)
 
         # ── Draw all 468 face landmarks ───────────────────────
-        if landmarks:
+        if landmarks is not None and len(landmarks) > 0:
             # Full mesh — tiny dots for all points
             for lm in landmarks:
                 x = int(lm.x * w)
