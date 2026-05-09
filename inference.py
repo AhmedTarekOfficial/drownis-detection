@@ -1,26 +1,41 @@
 # ============================================================
 #  inference.py  —  PyTorch Fatigue Detection Engine
+#  Compatible with mediapipe >= 0.10.30 (new Tasks API)
 # ============================================================
 
 import cv2
 import numpy as np
-import mediapipe as mp
 import torch
 import torch.nn.functional as F
 from torchvision import transforms
 from collections import deque
 import math
+import urllib.request
+import os
 
 from config import *
 from models import build_model, get_device
 
 
-# Support both old (<=0.10.9) and new MediaPipe API
-try:
-    mp_face_mesh = mp.solutions.face_mesh
-except AttributeError:
-    mp_face_mesh = None
-    print("Warning: mediapipe.solutions not available. Install mediapipe==0.10.9")
+# ──────────────────────────────────────────────────────────────
+# MEDIAPIPE  —  new Tasks API (0.10.30+)
+# ──────────────────────────────────────────────────────────────
+import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
+from mediapipe.tasks.python.vision import FaceLandmarker, FaceLandmarkerOptions, RunningMode
+
+# Download the face landmarker model if not present
+LANDMARKER_PATH = "face_landmarker.task"
+
+def _download_landmarker():
+    if not os.path.exists(LANDMARKER_PATH):
+        print("Downloading MediaPipe face landmarker model...")
+        url = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+        urllib.request.urlretrieve(url, LANDMARKER_PATH)
+        print("  ✓ Downloaded face_landmarker.task")
+
+_download_landmarker()
 
 
 # ──────────────────────────────────────────────────────────────
@@ -49,7 +64,7 @@ def compute_pitch(landmarks, w, h):
         (landmarks[i].x * w, landmarks[i].y * h)
         for i in [1, 152, 263, 33, 287, 57]
     ], dtype=np.float64)
-    fl = w
+    fl  = float(w)
     cam = np.array([[fl,0,w/2],[0,fl,h/2],[0,0,1]], dtype=np.float64)
     ok, rvec, _ = cv2.solvePnP(model_pts, img_pts, cam, np.zeros((4,1)),
                                 flags=cv2.SOLVEPNP_ITERATIVE)
@@ -62,15 +77,6 @@ def compute_pitch(landmarks, w, h):
 # ──────────────────────────────────────────────────────────────
 # ROI EXTRACTION
 # ──────────────────────────────────────────────────────────────
-def extract_roi(frame, landmarks, indices, w, h, padding=20):
-    pts = np.array([(int(landmarks[i].x*w), int(landmarks[i].y*h)) for i in indices])
-    x1 = max(0,  pts[:,0].min() - padding)
-    x2 = min(w,  pts[:,0].max() + padding)
-    y1 = max(0,  pts[:,1].min() - padding)
-    y2 = min(h,  pts[:,1].max() + padding)
-    roi = frame[y1:y2, x1:x2]
-    return roi if roi.size > 0 else None
-
 def extract_face_roi(frame, landmarks, w, h, padding=30):
     all_pts = np.array([(int(lm.x*w), int(lm.y*h)) for lm in landmarks])
     x1 = max(0, all_pts[:,0].min() - padding)
@@ -82,7 +88,7 @@ def extract_face_roi(frame, landmarks, w, h, padding=30):
 
 
 # ──────────────────────────────────────────────────────────────
-# PREPROCESS FOR PYTORCH MODEL
+# PREPROCESS FOR PYTORCH
 # ──────────────────────────────────────────────────────────────
 preprocess = transforms.Compose([
     transforms.ToPILImage(),
@@ -93,7 +99,6 @@ preprocess = transforms.Compose([
 ])
 
 def preprocess_roi(roi):
-    """BGR numpy → normalized tensor (1, 3, H, W)"""
     rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
     return preprocess(rgb).unsqueeze(0)
 
@@ -107,29 +112,43 @@ class FatigueEngine:
 
         # Load PyTorch model
         self.model = build_model(freeze_backbone=False)
-        self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+        self.model.load_state_dict(
+            torch.load(model_path, map_location=self.device, weights_only=True)
+        )
         self.model.to(self.device)
         self.model.eval()
-        print(f"  ✓ Model loaded from {model_path}")
+        print(f"  ✓ Model loaded: {model_path}")
 
-        self.face_mesh = mp_face_mesh.FaceMesh(
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=FACE_CONFIDENCE,
-            min_tracking_confidence=LANDMARK_CONFIDENCE
+        # MediaPipe Face Landmarker (new Tasks API)
+        options = FaceLandmarkerOptions(
+            base_options=mp_python.BaseOptions(model_asset_path=LANDMARKER_PATH),
+            running_mode=RunningMode.IMAGE,
+            num_faces=1,
+            min_face_detection_confidence=FACE_CONFIDENCE,
+            min_face_presence_confidence=FACE_CONFIDENCE,
+            min_tracking_confidence=LANDMARK_CONFIDENCE,
         )
+        self.landmarker = FaceLandmarker.create_from_options(options)
 
-        # Temporal smoothing
+        # Buffers
         self.score_history = deque(maxlen=TEMPORAL_WINDOW)
         self.ear_history   = deque(maxlen=TEMPORAL_WINDOW)
         self.frame_count   = 0
 
+    def _get_landmarks(self, frame):
+        """Run face landmarker → returns landmark list or None"""
+        rgb       = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image  = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        result    = self.landmarker.detect(mp_image)
+        if not result.face_landmarks:
+            return None
+        return result.face_landmarks[0]   # list of NormalizedLandmark
+
     def _predict(self, roi):
-        """Run model on a single ROI → drowsy probability (0-1)"""
         tensor = preprocess_roi(roi).to(self.device)
         with torch.no_grad():
             logits = self.model(tensor)
-            prob   = F.softmax(logits, dim=1)[0][1].item()  # prob of class 1 = drowsy
+            prob   = F.softmax(logits, dim=1)[0][1].item()
         return prob
 
     def process_frame(self, frame: np.ndarray) -> dict:
@@ -137,73 +156,56 @@ class FatigueEngine:
         h, w = frame.shape[:2]
 
         result = {
-            "frame":          frame.copy(),
-            "face_detected":  False,
-            "ear":            0.0,
-            "mar":            0.0,
-            "pitch":          0.0,
-            "drowsy_prob":    0.0,
-            "fatigue_score":  0.0,
-            "fatigue_level":  "ALERT",
+            "frame":         frame.copy(),
+            "face_detected": False,
+            "ear":           0.0,
+            "mar":           0.0,
+            "pitch":         0.0,
+            "drowsy_prob":   0.0,
+            "fatigue_score": 0.0,
+            "fatigue_level": "ALERT",
         }
 
-        rgb         = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mesh_result = self.face_mesh.process(rgb)
-
-        if not mesh_result.multi_face_landmarks:
+        landmarks = self._get_landmarks(frame)
+        if landmarks is None:
             return result
 
         result["face_detected"] = True
-        lm = mesh_result.multi_face_landmarks[0].landmark
 
-        # ── Geometric features ────────────────────────────────
-        ear   = (compute_ear(lm, LEFT_EYE_IDX,  w, h) +
-                 compute_ear(lm, RIGHT_EYE_IDX, w, h)) / 2.0
-        mar   = compute_mar(lm, MOUTH_IDX, w, h)
-        pitch = compute_pitch(lm, w, h)
+        ear   = (compute_ear(landmarks, LEFT_EYE_IDX,  w, h) +
+                 compute_ear(landmarks, RIGHT_EYE_IDX, w, h)) / 2.0
+        mar   = compute_mar(landmarks, MOUTH_IDX, w, h)
+        pitch = compute_pitch(landmarks, w, h)
 
-        result["ear"]   = ear
-        result["mar"]   = mar
-        result["pitch"] = pitch
+        result.update({"ear": ear, "mar": mar, "pitch": pitch})
         self.ear_history.append(ear)
 
-        # ── CNN prediction on face ROI ────────────────────────
-        face_roi = extract_face_roi(frame, lm, w, h)
-        if face_roi is not None:
-            drowsy_prob = self._predict(face_roi)
-        else:
-            # fallback to geometric only
-            drowsy_prob = float(ear < EAR_THRESHOLD or mar > MAR_THRESHOLD)
-
+        # CNN prediction
+        face_roi    = extract_face_roi(frame, landmarks, w, h)
+        drowsy_prob = self._predict(face_roi) if face_roi is not None \
+                      else float(ear < EAR_THRESHOLD or mar > MAR_THRESHOLD)
         result["drowsy_prob"] = drowsy_prob
 
-        # ── PERCLOS ───────────────────────────────────────────
+        # PERCLOS
         perclos = (np.array(self.ear_history) < EAR_THRESHOLD).mean() \
                   if self.ear_history else 0.0
 
-        # ── Score fusion ──────────────────────────────────────
-        # CNN carries most weight, geometric features support it
+        # Score fusion
         score = (
-            drowsy_prob             * 60 +   # CNN output    60%
-            perclos                 * 25 +   # eye closure   25%
-            float(mar > MAR_THRESHOLD) * 10 + # yawning      10%
-            float(abs(pitch) > PITCH_THRESHOLD) * 5  # head  5%
+            drowsy_prob                          * 60 +
+            perclos                              * 25 +
+            float(mar > MAR_THRESHOLD)           * 10 +
+            float(abs(pitch) > PITCH_THRESHOLD)  *  5
         )
         self.score_history.append(score)
+        smooth = np.mean(self.score_history)
+        result["fatigue_score"] = smooth
+        result["fatigue_level"] = (
+            "DANGER"  if smooth >= 60 else
+            "WARNING" if smooth >= 30 else
+            "ALERT"
+        )
 
-        # Temporal smoothing
-        smooth_score = np.mean(self.score_history)
-        result["fatigue_score"] = smooth_score
-
-        # ── Level ─────────────────────────────────────────────
-        if smooth_score < 30:
-            result["fatigue_level"] = "ALERT"
-        elif smooth_score < 60:
-            result["fatigue_level"] = "WARNING"
-        else:
-            result["fatigue_level"] = "DANGER"
-
-        # ── Annotate frame ────────────────────────────────────
         result["frame"] = self._annotate(frame, result)
         return result
 
@@ -211,17 +213,17 @@ class FatigueEngine:
         ann   = frame.copy()
         score = result["fatigue_score"]
         level = result["fatigue_level"]
-        color = {"ALERT": (0,200,0), "WARNING": (0,200,255), "DANGER": (0,0,255)}[level]
+        color = {"ALERT":(0,200,0),"WARNING":(0,200,255),"DANGER":(0,0,255)}[level]
 
         bar_w = int(score / 100 * 250)
         cv2.rectangle(ann, (10,10), (260,30), (50,50,50), -1)
         cv2.rectangle(ann, (10,10), (10+bar_w,30), color, -1)
-
         cv2.putText(ann, f"{level}  {score:.0f}%",
                     (10,55), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-        cv2.putText(ann, f"EAR:{result['ear']:.2f}  MAR:{result['mar']:.2f}  Pitch:{result['pitch']:.1f}",
+        cv2.putText(ann,
+                    f"EAR:{result['ear']:.2f}  MAR:{result['mar']:.2f}  Pitch:{result['pitch']:.1f}",
                     (10,80), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180,180,180), 1)
         return ann
 
     def release(self):
-        self.face_mesh.close()
+        self.landmarker.close()
