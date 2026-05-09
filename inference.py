@@ -206,23 +206,77 @@ class FatigueEngine:
             "ALERT"
         )
 
+        result["landmarks"] = landmarks
         result["frame"] = self._annotate(frame, result)
         return result
 
     def _annotate(self, frame, result):
         ann   = frame.copy()
+        h, w  = ann.shape[:2]
         score = result["fatigue_score"]
         level = result["fatigue_level"]
         color = {"ALERT":(0,200,0),"WARNING":(0,200,255),"DANGER":(0,0,255)}[level]
+        landmarks = result.get("landmarks", None)
 
+        # ── Draw all 468 face landmarks ───────────────────────
+        if landmarks:
+            # Full mesh — tiny dots for all points
+            for lm in landmarks:
+                x = int(lm.x * w)
+                y = int(lm.y * h)
+                cv2.circle(ann, (x, y), 1, (0, 180, 180), -1)
+
+            # Eye landmarks — highlighted in accent color
+            for idx in LEFT_EYE_IDX + RIGHT_EYE_IDX:
+                x = int(landmarks[idx].x * w)
+                y = int(landmarks[idx].y * h)
+                cv2.circle(ann, (x, y), 3, (0, 229, 255), -1)
+
+            # Connect eye points with lines
+            for eye_idx in [LEFT_EYE_IDX, RIGHT_EYE_IDX]:
+                pts = np.array([
+                    (int(landmarks[i].x * w), int(landmarks[i].y * h))
+                    for i in eye_idx
+                ], dtype=np.int32)
+                cv2.polylines(ann, [pts], isClosed=True, color=(0, 229, 255), thickness=1)
+
+            # Mouth landmarks — highlighted in yellow
+            for idx in MOUTH_IDX:
+                x = int(landmarks[idx].x * w)
+                y = int(landmarks[idx].y * h)
+                cv2.circle(ann, (x, y), 3, (0, 215, 255), -1)
+
+            # Connect mouth points
+            mouth_pts = np.array([
+                (int(landmarks[i].x * w), int(landmarks[i].y * h))
+                for i in MOUTH_IDX
+            ], dtype=np.int32)
+            cv2.polylines(ann, [mouth_pts], isClosed=True, color=(0, 215, 255), thickness=1)
+
+        # ── HUD overlay ───────────────────────────────────────
+        # Score bar background
+        cv2.rectangle(ann, (10, 10), (260, 30), (30, 30, 30), -1)
         bar_w = int(score / 100 * 250)
-        cv2.rectangle(ann, (10,10), (260,30), (50,50,50), -1)
-        cv2.rectangle(ann, (10,10), (10+bar_w,30), color, -1)
+        cv2.rectangle(ann, (10, 10), (10 + bar_w, 30), color, -1)
+        cv2.rectangle(ann, (10, 10), (260, 30), (80, 80, 80), 1)
+
+        # Level + score text
         cv2.putText(ann, f"{level}  {score:.0f}%",
-                    (10,55), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                    (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+        # Metrics
         cv2.putText(ann,
-                    f"EAR:{result['ear']:.2f}  MAR:{result['mar']:.2f}  Pitch:{result['pitch']:.1f}",
-                    (10,80), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180,180,180), 1)
+                    f"EAR:{result['ear']:.2f}  MAR:{result['mar']:.2f}  Pitch:{result['pitch']:.1f}deg",
+                    (10, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1)
+
+        # Drowsy probability bar (small, bottom left)
+        prob = result.get("drowsy_prob", 0)
+        prob_w = int(prob * 120)
+        cv2.putText(ann, "DROWSY PROB", (10, h - 35),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (120, 120, 120), 1)
+        cv2.rectangle(ann, (10, h - 25), (130, h - 12), (30, 30, 30), -1)
+        cv2.rectangle(ann, (10, h - 25), (10 + prob_w, h - 12), color, -1)
+
         return ann
 
     def release(self):
