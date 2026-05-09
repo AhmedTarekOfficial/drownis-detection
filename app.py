@@ -237,9 +237,9 @@ init_state()
 #  LOAD ENGINE  (cached)
 # ══════════════════════════════════════════════════════════════
 @st.cache_resource(show_spinner=False)
-def load_engine(model_path):
+def load_engine(eye_path, mouth_path, head_path, micro_path=None):
     from inference import FatigueEngine
-    return FatigueEngine(model_path)
+    return FatigueEngine(eye_path, mouth_path, head_path, micro_path)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -391,16 +391,11 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
 
-    st.markdown("#### ⚙️ Model Path")
-    model_path = st.text_input(
-        "Fatigue Model (.pth)",
-        value="saved_models/fatigue_phase2.pth"
-    )
-    # fallback to phase1 if phase2 not found
-    if not os.path.exists(model_path):
-        fallback = "saved_models/fatigue_phase1.pth"
-        if os.path.exists(fallback):
-            model_path = fallback
+    st.markdown("#### ⚙️ Model Paths")
+    eye_path   = st.text_input("Eye Model (.h5)",   value="saved_models/eye_model.h5")
+    mouth_path = st.text_input("Mouth Model (.h5)", value="saved_models/mouth_model.h5")
+    head_path  = st.text_input("Head Model (.h5)",  value="saved_models/head_model.h5")
+    micro_path = st.text_input("Microsleep Model (optional)", value="")
 
     st.markdown("---")
     st.markdown("#### 🎛️ Thresholds")
@@ -411,16 +406,20 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("#### 🔔 Alerts")
-    audio_alert    = st.toggle("Audio Alert on DANGER", value=True)
-    show_landmarks = st.toggle("Show Face Landmarks",   value=False)
+    audio_alert = st.toggle("Audio Alert on DANGER", value=True)
+    show_landmarks = st.toggle("Show Face Landmarks", value=False)
 
     st.markdown("---")
-    models_ready = os.path.exists(model_path)
+    models_ready = all([
+        os.path.exists(eye_path),
+        os.path.exists(mouth_path),
+        os.path.exists(head_path),
+    ])
 
     if models_ready:
-        st.success(f"✓ Model found — Ready\n\n`{os.path.basename(model_path)}`")
+        st.success("✓ Models found — Ready")
     else:
-        st.warning("⚠ Model file not found.\n\nTrain first:\n`python train.py`\n\nThen update the path above.")
+        st.warning("⚠ Model files not found.\nTrain first: `python train.py --model all`")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -497,8 +496,8 @@ with tab_webcam:
             st.session_state.running = False
         else:
             try:
-                 engine = load_engine(model_path)   # ✅ was: load_engine(eye_path, ...)
-                 cap = cv2.VideoCapture(tmp_path)
+                engine = load_engine(eye_path, mouth_path, head_path,
+                                     micro_path if micro_path else None)
             except Exception as e:
                 st.error(f"Failed to load models: {e}")
                 st.session_state.running = False
@@ -640,7 +639,7 @@ with tab_video:
                 try:
                     engine = load_engine(eye_path, mouth_path, head_path,
                                          micro_path if micro_path else None)
-                    cap = cv2.VideoCapture(tmp_path)
+                    cap    = cv2.VideoCapture(tmp_path)
                     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
                     video_scores = []
