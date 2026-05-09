@@ -431,33 +431,58 @@ with tab_video:
                     engine       = load_engine(model_path)
                     cap          = cv2.VideoCapture(tmp_path)
                     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    fps          = cap.get(cv2.CAP_PROP_FPS) or 30
+
+                    BATCH_SIZE   = 8   # عدد الـ frames في كل batch
                     video_scores = []
                     video_events = []
                     fnum         = 0
+                    batch_frames = []
+                    batch_fnums  = []
 
                     while True:
                         ret, frame = cap.read()
-                        if not ret: break
+                        if not ret:
+                            # process any remaining frames
+                            if batch_frames:
+                                batch_results = engine.process_batch(batch_frames)
+                                for res, fn in zip(batch_results, batch_fnums):
+                                    score = res["fatigue_score"]
+                                    level = res["fatigue_level"]
+                                    video_scores.append(score)
+                                    if res["face_detected"]:
+                                        video_events.append({"frame": fn, "level": level, "score": round(score,1)})
+                                if batch_results:
+                                    last = batch_results[-1]
+                                    disp = cv2.cvtColor(last["frame"], cv2.COLOR_BGR2RGB)
+                                    vframe_ph.image(disp, use_container_width=True)
+                            break
+
                         fnum += 1
+                        batch_frames.append(frame)
+                        batch_fnums.append(fnum)
 
-                        result = engine.process_frame(frame)
-                        score  = result["fatigue_score"]
-                        level  = result["fatigue_level"]
-                        video_scores.append(score)
+                        # Process when batch is full
+                        if len(batch_frames) >= BATCH_SIZE:
+                            batch_results = engine.process_batch(batch_frames)
 
-                        if result["face_detected"]:
-                            video_events.append({
-                                "frame": fnum,
-                                "level": level,
-                                "score": round(score, 1),
-                            })
+                            for res, fn in zip(batch_results, batch_fnums):
+                                score = res["fatigue_score"]
+                                level = res["fatigue_level"]
+                                video_scores.append(score)
+                                if res["face_detected"]:
+                                    video_events.append({"frame": fn, "level": level, "score": round(score,1)})
 
-                        if fnum % 5 == 0:
-                            disp = cv2.cvtColor(result["frame"], cv2.COLOR_BGR2RGB)
+                            # Show last frame of batch in UI
+                            last = batch_results[-1]
+                            score = last["fatigue_score"]
+                            level = last["fatigue_level"]
+                            disp  = cv2.cvtColor(last["frame"], cv2.COLOR_BGR2RGB)
+
                             vframe_ph.image(disp, use_container_width=True)
                             vprogress.progress(
-                                min(fnum / max(total_frames,1), 1.0),
-                                text=f"Frame {fnum}/{total_frames}"
+                                min(fnum / max(total_frames, 1), 1.0),
+                                text=f"Batch processing... {fnum}/{total_frames} frames  |  Batch size: {BATCH_SIZE}"
                             )
                             vstatus_ph.markdown(
                                 f'<div class="status-badge badge-{level_class(level)}">{level}</div>',
@@ -471,6 +496,10 @@ with tab_video:
                                 make_timeline_chart(deque(video_scores[-200:], maxlen=200)),
                                 use_container_width=True, key=f"vtl_{fnum}"
                             )
+
+                            # Reset batch
+                            batch_frames = []
+                            batch_fnums  = []
 
                     cap.release()
                     os.unlink(tmp_path)
